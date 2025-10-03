@@ -2,7 +2,7 @@ replicaCount: 1
 
 image:
   repository: registry.pwlab.dev/paperless-scan-adapter
-  tag: latest
+  tag: "0.1.1"
   pullPolicy: Always
 
 imagePullSecrets: []

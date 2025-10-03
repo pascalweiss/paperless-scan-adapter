@@ -4,7 +4,7 @@ stages:
 
 variables:
   IMAGE_NAME: "paperless-scan-adapter"
-  TAG: "0.1.0"
+  TAG: "0.1.1"
 
 .default-before-script: &default-before-script
   - 'echo "Runner info: $CI_RUNNER_DESCRIPTION"'

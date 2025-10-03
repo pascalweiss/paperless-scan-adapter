@@ -48,18 +48,35 @@ def get_pdf_files(folder: Path) -> List[Path]:
 
 
 def is_pdf_valid(filepath: Path) -> bool:
-    """Check if PDF file has proper EOF marker."""
+    """Check whether the PDF file ends with an EOF marker.
+
+    The PDF spec requires the final non-whitespace characters to be ``%%EOF``. Many
+    scanners use Windows style ``\r\n`` endings or add trailing whitespace, so we
+    trim trailing whitespace before checking for the marker.
+    """
+
     try:
         with open(filepath, 'rb') as f:
-            # Seek to last 6 bytes and check for %%EOF\n
-            f.seek(-6, os.SEEK_END)
-            last_bytes = f.read()
-            is_valid = last_bytes == b'%%EOF\n'
-            if is_valid:
-                logger.debug(f"PDF valid: {filepath.name}")
-            else:
-                logger.debug(f"PDF invalid (missing EOF): {filepath.name}")
-            return is_valid
+            f.seek(0, os.SEEK_END)
+            file_size = f.tell()
+
+            if file_size == 0:
+                logger.debug(f"PDF invalid (empty file): {filepath.name}")
+                return False
+
+            chunk_size = min(1024, file_size)
+            f.seek(-chunk_size, os.SEEK_END)
+            tail = f.read()
+
+        trimmed_tail = tail.rstrip(b"\x00\t\n\r \f")
+        is_valid = trimmed_tail.endswith(b'%%EOF')
+
+        if is_valid:
+            logger.debug(f"PDF valid: {filepath.name}")
+        else:
+            logger.debug(f"PDF invalid (missing EOF): {filepath.name}")
+
+        return is_valid
     except Exception as e:
         logger.error(f"Error validating PDF {filepath.name}: {e}")
         return False
