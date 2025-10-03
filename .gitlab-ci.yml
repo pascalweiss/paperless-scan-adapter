@@ -1,0 +1,39 @@
+stages:
+  - build
+  - test
+
+variables:
+  IMAGE_NAME: "paperless-scan-adapter"
+  TAG: "0.1.0"
+
+.default-before-script: &default-before-script
+  - 'echo "Runner info: $CI_RUNNER_DESCRIPTION"'
+  - cat /etc/os-release
+
+build-docker-image:
+  stage: build
+  image: registry.pwlab.dev/build-tools:0.1.0
+  tags:
+    - kubernetes
+  before_script: *default-before-script
+  script:
+    - $CI_PROJECT_DIR/run/build_and_push.sh
+
+build-helm-chart:
+  stage: build
+  image: registry.pwlab.dev/build-tools:0.1.0
+  tags:
+    - kubernetes
+  before_script: *default-before-script
+  script:
+    - $CI_PROJECT_DIR/run/helm_package.sh
+    - $CI_PROJECT_DIR/run/helm_publish.sh
+
+secret-detection:
+  stage: test
+  image: zricethezav/gitleaks:latest
+  tags:
+    - kubernetes
+  before_script: *default-before-script
+  script:
+    - gitleaks detect --verbose --source=$CI_PROJECT_DIR

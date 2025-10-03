@@ -1,0 +1,17 @@
+{{- if and .Values.persistence.enabled .Values.persistence.persistentVolume.enabled }}
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: {{ include "paperless-scan-adapter.pvName" . }}
+  labels:
+    {{- include "paperless-scan-adapter.labels" . | nindent 4 }}
+    {{- with .Values.persistence.persistentVolume.extraLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.persistence.persistentVolume.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+{{ toYaml .Values.persistence.persistentVolume.spec | indent 2 }}
+{{- end }}

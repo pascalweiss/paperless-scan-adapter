@@ -1,0 +1,135 @@
+replicaCount: 1
+
+image:
+  repository: registry.pwlab.dev/paperless-scan-adapter
+  tag: latest
+  pullPolicy: Always
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+strategy:
+  type: Recreate
+
+serviceAccount:
+  create: false
+  automount: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext: {}
+securityContext: {}
+
+service:
+  enabled: false
+  type: ClusterIP
+  port: 80
+  annotations: {}
+  labels: {}
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts: []
+  tls: []
+
+config:
+  enabled: true
+  nameOverride: ""
+  annotations: {}
+  extraLabels: {}
+  data:
+    VALIDATION_RETRY_COUNT: "5"
+    VALIDATION_RETRY_BASE_WAIT_SECONDS: "10"
+    UPLOAD_RETRY_COUNT: "3"
+    UPLOAD_RETRY_BASE_WAIT_SECONDS: "5"
+    SCAN_INTERVAL_SECONDS: "5"
+    PAPERLESS_API_URL: "http://paperless-ngx.paperless-ngx.svc.cluster.local:8000"
+    SCAN_FOLDER_PATH: "/mnt/scan/scan"
+    ARCHIVE_FOLDER_PATH: "/mnt/scan/scan/archive"
+    LOG_LEVEL: "INFO"
+    PAPERLESS_ADMIN_USER: "admin"
+
+env:
+  extraEnv: []
+  secretRefs:
+    - name: PAPERLESS_ADMIN_PASSWORD
+      secretName: paperless-admin
+      secretKey: password
+      optional: false
+  extraEnvFrom: []
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 256Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 1
+  targetCPUUtilizationPercentage: 80
+
+livenessProbe: {}
+readinessProbe: {}
+
+persistence:
+  enabled: true
+  claimName: paperless-scan-adapter-smb
+  existingClaim: ""
+  mountPath: /mnt/scan
+  subPath: ""
+  accessModes:
+    - ReadWriteMany
+  size: 1Gi
+  storageClassName: smb-paperless-scan
+  volumeName: paperless-scan-adapter-pv
+  annotations: {}
+  selector: {}
+  persistentVolume:
+    enabled: true
+    name: paperless-scan-adapter-pv
+    annotations: {}
+    extraLabels: {}
+    spec:
+      capacity:
+        storage: 1Gi
+      accessModes:
+        - ReadWriteMany
+      persistentVolumeReclaimPolicy: Retain
+      storageClassName: smb-paperless-scan
+      mountOptions:
+        - vers=3.0
+        - dir_mode=0777
+        - file_mode=0777
+        - uid=1000
+        - gid=1000
+        - cache=strict
+        - actimeo=30
+      csi:
+        driver: smb.csi.k8s.io
+        volumeHandle: paperless-scan-adapter-pv
+        volumeAttributes:
+          source: "//192.168.8.52/homelab-share"
+        nodeStageSecretRef:
+          name: paperless-smb-credentials
+          namespace: paperless-ngx
+
+volumeMounts: []
+volumes: []
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+namespace:
+  create: false
+  annotations: {}
