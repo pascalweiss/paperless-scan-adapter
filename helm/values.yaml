@@ -2,7 +2,7 @@ replicaCount: 1
 
 image:
   repository: registry.pwlab.dev/paperless-scan-adapter
-  tag: "0.2.0"
+  tag: "0.2.1"
   pullPolicy: Always
 
 imagePullSecrets: []
@@ -24,10 +24,13 @@ podLabels: {}
 podSecurityContext: {}
 securityContext: {}
 
+# Enabled so Prometheus has a stable target for /metrics. Nothing else talks to this
+# workload; the port serves /healthz, /readyz and /metrics only. Keep in sync with
+# config.data.HEALTH_PORT, the probes reference the same number.
 service:
-  enabled: false
+  enabled: true
   type: ClusterIP
-  port: 80
+  port: 8080
   annotations: {}
   labels: {}
 

@@ -29,6 +29,17 @@ daemon thread, so it keeps answering even while the worker is busy or blocked.
 |------|---------|----------|----------|
 | `/healthz` | liveness | the worker is not wedged | the loop heartbeat is older than `HEALTH_STALE_AFTER_SECONDS` |
 | `/readyz` | readiness | startup finished and the heartbeat is fresh | still waiting for a dependency, or the heartbeat is stale |
+| `/metrics` | Prometheus scrape | always | — |
+
+`/metrics` exposes the same state in the Prometheus text format, prefixed
+`paperless_scan_adapter_`: `alive`, `ready`, `seconds_since_last_beat`,
+`uptime_seconds`, `uploads_total` and `upload_failures_total`. The failure counter is
+the one that cannot be seen any other way: when an upload fails for good the adapter
+moves the file to the archive folder and carries on, so the document silently never
+reaches Paperless.
+
+A `ClusterIP` Service is enabled by default to give Prometheus a stable target. Nothing
+else talks to this workload.
 
 Both return the full state as JSON, which makes them useful to `curl` by hand:
 

@@ -127,8 +127,35 @@ def sleep_with_heartbeat(seconds: float) -> None:
         time.sleep(min(HEARTBEAT_SLICE_SECONDS, remaining))
 
 
+METRIC_PREFIX = 'paperless_scan_adapter'
+
+# name -> (type, help, key in the health snapshot)
+METRICS = (
+    ('alive', 'gauge', 'Whether the worker is not wedged (1) or its heartbeat went stale (0).', 'alive'),
+    ('ready', 'gauge', 'Whether startup finished and the worker heartbeat is fresh.', 'ready'),
+    ('seconds_since_last_beat', 'gauge', 'Age of the worker heartbeat in seconds.', 'seconds_since_last_beat'),
+    ('uptime_seconds', 'gauge', 'Seconds since the process started.', 'uptime_seconds'),
+    ('uploads_total', 'counter', 'Documents successfully handed to Paperless.', 'uploads'),
+    ('upload_failures_total', 'counter', 'Documents archived after the upload failed.', 'upload_failures'),
+)
+
+
+def render_metrics(state: Dict) -> str:
+    """Render the health snapshot in the Prometheus text exposition format."""
+    lines = []
+    for name, kind, description, key in METRICS:
+        full = f"{METRIC_PREFIX}_{name}"
+        value = state[key]
+        if isinstance(value, bool):
+            value = int(value)
+        lines.append(f"# HELP {full} {description}")
+        lines.append(f"# TYPE {full} {kind}")
+        lines.append(f"{full} {value}")
+    return "\n".join(lines) + "\n"
+
+
 class HealthHandler(BaseHTTPRequestHandler):
-    """Serves /healthz (liveness) and /readyz (readiness)."""
+    """Serves /healthz (liveness), /readyz (readiness) and /metrics."""
 
     protocol_version = 'HTTP/1.1'
 
@@ -140,13 +167,21 @@ class HealthHandler(BaseHTTPRequestHandler):
             self._respond(200 if state["alive"] else 503, state)
         elif path == '/readyz':
             self._respond(200 if state["ready"] else 503, state)
+        elif path == '/metrics':
+            self._respond_text(200, render_metrics(state))
         else:
-            self._respond(404, {"error": "not found", "paths": ["/healthz", "/readyz"]})
+            self._respond(404, {"error": "not found", "paths": ["/healthz", "/readyz", "/metrics"]})
 
     def _respond(self, status: int, payload: Dict) -> None:
         body = json.dumps(payload, indent=2).encode() + b"\n"
+        self._write(status, 'application/json', body)
+
+    def _respond_text(self, status: int, text: str) -> None:
+        self._write(status, 'text/plain; version=0.0.4; charset=utf-8', text.encode())
+
+    def _write(self, status: int, content_type: str, body: bytes) -> None:
         self.send_response(status)
-        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Type', content_type)
         self.send_header('Content-Length', str(len(body)))
         self.end_headers()
         self.wfile.write(body)
