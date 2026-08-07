@@ -20,6 +20,38 @@ The chart defaults match the example deployment:
 
 Render values with `helm show values ./helm` and override them through your GitOps repository (e.g. Flux `HelmRelease`).
 
+## Health Endpoint
+
+The adapter serves a small HTTP endpoint (default port `8080`, `HEALTH_PORT`) from a
+daemon thread, so it keeps answering even while the worker is busy or blocked.
+
+| Path | Meaning | 200 when | 503 when |
+|------|---------|----------|----------|
+| `/healthz` | liveness | the worker is not wedged | the loop heartbeat is older than `HEALTH_STALE_AFTER_SECONDS` |
+| `/readyz` | readiness | startup finished and the heartbeat is fresh | still waiting for a dependency, or the heartbeat is stale |
+
+Both return the full state as JSON, which makes them useful to `curl` by hand:
+
+```bash
+kubectl -n paperless-ngx port-forward deploy/paperless-scan-adapter 8080:8080
+curl -s localhost:8080/healthz | jq
+```
+
+**Why liveness is heartbeat based.** The worker polls a network share. If that mount goes
+stale, a read can block indefinitely instead of raising, and the process stays `Running`
+while no document is ever processed again. The worker therefore records a heartbeat
+whenever it reaches a line of code, and every deliberate wait beats in slices
+(`HEARTBEAT_SLICE_SECONDS`), so slow work is never mistaken for a wedge. Only a real
+block stops the beat. `HEALTH_STALE_AFTER_SECONDS` defaults to 120s, comfortably above
+the longest single blocking call (the 60s upload timeout).
+
+**Startup waits instead of exiting.** A missing scan folder or an unreachable Paperless
+is not a failure, it is a dependency that has not arrived yet. The adapter retries with
+capped exponential backoff and reports `alive` but not `ready` meanwhile. Exiting would
+only hand the same wait back to Kubernetes, inflate the restart counter and delay the
+start by the CrashLoopBackOff. A missing `PAPERLESS_ADMIN_PASSWORD` still exits
+immediately, because no amount of retrying fixes a configuration error.
+
 ## GitLab CI Pipeline
 
 The pipeline defined in `.gitlab-ci.yml` performs three jobs:

@@ -2,7 +2,7 @@ replicaCount: 1
 
 image:
   repository: registry.pwlab.dev/paperless-scan-adapter
-  tag: "0.1.1"
+  tag: "0.2.0"
   pullPolicy: Always
 
 imagePullSecrets: []
@@ -54,6 +54,8 @@ config:
     ARCHIVE_FOLDER_PATH: "/mnt/scan/scan/archive"
     LOG_LEVEL: "INFO"
     PAPERLESS_ADMIN_USER: "admin"
+    HEALTH_PORT: "8080"
+    HEALTH_STALE_AFTER_SECONDS: "120"
 
 env:
   extraEnv: []
@@ -78,8 +80,27 @@ autoscaling:
   maxReplicas: 1
   targetCPUUtilizationPercentage: 80
 
-livenessProbe: {}
-readinessProbe: {}
+# The worker is a polling loop with no inbound traffic, so these probes exist for one
+# reason: a wedged loop (a blocking read on a stale SMB handle) leaves the process
+# "Running" forever while no scan is processed. /healthz reports the loop heartbeat and
+# turns 503 once it goes stale, which converts a silent stall into a visible restart.
+# Keep the port in sync with config.data.HEALTH_PORT.
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: 8080
+  initialDelaySeconds: 10
+  periodSeconds: 30
+  timeoutSeconds: 5
+  failureThreshold: 3
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: 8080
+  initialDelaySeconds: 5
+  periodSeconds: 15
+  timeoutSeconds: 5
+  failureThreshold: 3
 
 persistence:
   enabled: true

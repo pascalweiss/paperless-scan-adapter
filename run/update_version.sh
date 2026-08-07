@@ -32,7 +32,14 @@ validate_version() {
   fi
 }
 
-CURRENT_VERSION=$(grep -oP 'TAG:\s*"?\K[0-9]+\.[0-9]+\.[0-9]+' .gitlab-ci.yml || true)
+# Uses python3 like the rewrite steps below, because `grep -oP` is GNU only and this
+# script is normally run from a Mac, where BSD grep rejects -P.
+CURRENT_VERSION=$(python3 - <<'PY'
+import re, pathlib
+match = re.search(r'TAG:\s*"?([0-9]+\.[0-9]+\.[0-9]+)', pathlib.Path('.gitlab-ci.yml').read_text())
+print(match.group(1) if match else '')
+PY
+)
 if [[ -z "$CURRENT_VERSION" ]]; then
   echo "Error: Could not determine current version from .gitlab-ci.yml" >&2
   exit 1

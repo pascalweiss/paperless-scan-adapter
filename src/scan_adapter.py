@@ -5,9 +5,12 @@ Paperless Scan Adapter - Monitors Samba scan folder and uploads PDFs to Paperles
 
 import os
 import sys
+import json
 import time
 import logging
+import threading
 import requests
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional, List, Dict
 
@@ -24,6 +27,17 @@ LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
 PAPERLESS_ADMIN_USER = os.getenv('PAPERLESS_ADMIN_USER', 'admin')
 PAPERLESS_ADMIN_PASSWORD = os.getenv('PAPERLESS_ADMIN_PASSWORD', '')
 
+# Health endpoint. The heartbeat must outlive any single blocking call the worker
+# makes; the upload request timeout of 60s is the longest one, hence the default of
+# 120s. Deliberate waits keep beating, see sleep_with_heartbeat.
+HEALTH_PORT = int(os.getenv('HEALTH_PORT', '8080'))
+HEALTH_STALE_AFTER_SECONDS = int(os.getenv('HEALTH_STALE_AFTER_SECONDS', '120'))
+HEARTBEAT_SLICE_SECONDS = int(os.getenv('HEARTBEAT_SLICE_SECONDS', '5'))
+
+# Startup waits for things that may simply not be up yet (the SMB mount, Paperless).
+STARTUP_RETRY_BASE_WAIT_SECONDS = int(os.getenv('STARTUP_RETRY_BASE_WAIT_SECONDS', '5'))
+STARTUP_RETRY_MAX_WAIT_SECONDS = int(os.getenv('STARTUP_RETRY_MAX_WAIT_SECONDS', '60'))
+
 # Global retry state to track validation attempts for invalid files
 # Structure: {file_path: {"retry_count": int, "next_retry_time": float}}
 retry_state: Dict[str, Dict] = {}
@@ -35,6 +49,121 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
+
+class HealthState:
+    """Liveness and readiness state, shared between the worker and the HTTP thread.
+
+    The worker calls beat() whenever it reaches a line of code. A wedged worker (a
+    blocking read on a stale SMB handle, a deadlock) stops beating while the HTTP
+    thread keeps answering, which is exactly the condition a liveness probe has to
+    catch. Slow work is not a wedge, so every deliberate wait beats as well.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._started_at = time.time()
+        self._last_beat_at = time.time()
+        self._startup_complete = False
+        self._last_auth_ok_at: Optional[float] = None
+        self._uploads = 0
+        self._upload_failures = 0
+
+    def beat(self) -> None:
+        with self._lock:
+            self._last_beat_at = time.time()
+
+    def startup_completed(self) -> None:
+        with self._lock:
+            self._startup_complete = True
+
+    def auth_succeeded(self) -> None:
+        with self._lock:
+            self._last_auth_ok_at = time.time()
+
+    def upload_recorded(self, *, success: bool) -> None:
+        with self._lock:
+            if success:
+                self._uploads += 1
+            else:
+                self._upload_failures += 1
+
+    def snapshot(self) -> Dict:
+        """Current state plus the derived verdicts, as one consistent reading."""
+        with self._lock:
+            now = time.time()
+            beat_age = now - self._last_beat_at
+            # While starting up we are deliberately retrying, which is alive but not
+            # ready. Killing the pod here would only restart the same wait.
+            alive = (not self._startup_complete) or beat_age <= HEALTH_STALE_AFTER_SECONDS
+            ready = self._startup_complete and beat_age <= HEALTH_STALE_AFTER_SECONDS
+            return {
+                "alive": alive,
+                "ready": ready,
+                "startup_complete": self._startup_complete,
+                "seconds_since_last_beat": round(beat_age, 1),
+                "stale_after_seconds": HEALTH_STALE_AFTER_SECONDS,
+                "uptime_seconds": round(now - self._started_at, 1),
+                "last_auth_ok_age_seconds": (
+                    round(now - self._last_auth_ok_at, 1) if self._last_auth_ok_at else None
+                ),
+                "uploads": self._uploads,
+                "upload_failures": self._upload_failures,
+                "scan_folder": str(SCAN_FOLDER_PATH),
+            }
+
+
+health = HealthState()
+
+
+def sleep_with_heartbeat(seconds: float) -> None:
+    """Sleep in slices so a deliberate wait never looks like a wedge."""
+    deadline = time.monotonic() + seconds
+    while True:
+        health.beat()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(HEARTBEAT_SLICE_SECONDS, remaining))
+
+
+class HealthHandler(BaseHTTPRequestHandler):
+    """Serves /healthz (liveness) and /readyz (readiness)."""
+
+    protocol_version = 'HTTP/1.1'
+
+    def do_GET(self) -> None:  # noqa: N802 - name mandated by BaseHTTPRequestHandler
+        path = self.path.split('?', 1)[0].rstrip('/') or '/'
+        state = health.snapshot()
+
+        if path in ('/healthz', '/'):
+            self._respond(200 if state["alive"] else 503, state)
+        elif path == '/readyz':
+            self._respond(200 if state["ready"] else 503, state)
+        else:
+            self._respond(404, {"error": "not found", "paths": ["/healthz", "/readyz"]})
+
+    def _respond(self, status: int, payload: Dict) -> None:
+        body = json.dumps(payload, indent=2).encode() + b"\n"
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args) -> None:
+        # The default implementation writes every request to stderr, which would
+        # drown the application log once a probe runs every few seconds.
+        logger.debug("health: %s", format % args)
+
+
+def start_health_server() -> None:
+    """Start the health endpoint in a daemon thread, before anything can block."""
+    server = ThreadingHTTPServer(('0.0.0.0', HEALTH_PORT), HealthHandler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, name='health', daemon=True)
+    thread.start()
+    logger.info(f"Health endpoint listening on :{HEALTH_PORT} (/healthz, /readyz)")
 
 
 def get_pdf_files(folder: Path) -> List[Path]:
@@ -94,7 +223,7 @@ def retry_validation_with_backoff(filepath: Path) -> bool:
         if attempt < VALIDATION_RETRY_COUNT - 1:
             wait_time = VALIDATION_RETRY_BASE_WAIT_SECONDS * (2 ** attempt)
             logger.info(f"Validation retry {attempt + 1}/{VALIDATION_RETRY_COUNT} failed, waiting {wait_time}s")
-            time.sleep(wait_time)
+            sleep_with_heartbeat(wait_time)
 
     logger.warning(f"PDF validation failed after {VALIDATION_RETRY_COUNT} retries: {filepath.name}")
     return False
@@ -116,6 +245,7 @@ def authenticate_paperless() -> Optional[str]:
         if response.status_code == 200:
             token = response.json().get('token')
             logger.debug("Authentication successful")
+            health.auth_succeeded()
             return token
         else:
             logger.error(f"Authentication failed: {response.status_code} - {response.text}")
@@ -171,7 +301,7 @@ def upload_to_paperless_with_retry(filepath: Path) -> bool:
         if attempt < UPLOAD_RETRY_COUNT - 1:
             wait_time = UPLOAD_RETRY_BASE_WAIT_SECONDS * (2 ** attempt)
             logger.info(f"Upload retry {attempt + 1}/{UPLOAD_RETRY_COUNT} failed, waiting {wait_time}s")
-            time.sleep(wait_time)
+            sleep_with_heartbeat(wait_time)
 
             # Re-authenticate for retry
             token = authenticate_paperless()
@@ -278,13 +408,41 @@ def process_pdf_file(filepath: Path) -> bool:
     # Attempt upload
     if upload_to_paperless_with_retry(filepath):
         # Upload successful, delete file
+        health.upload_recorded(success=True)
         delete_file(filepath)
         return True
     else:
         # Upload failed after retries, move to archive
+        health.upload_recorded(success=False)
         logger.warning(f"Archiving file after upload failure: {filepath.name}")
         move_to_archive(filepath)
         return True
+
+
+def wait_until(condition, description: str) -> None:
+    """Block until condition() is true, with capped exponential backoff.
+
+    Used for startup dependencies that are expected to arrive on their own. The wait
+    is unbounded on purpose: there is no useful number of attempts after which giving
+    up beats keeping the pod alive and ready to work the moment the dependency shows.
+    """
+    attempt = 0
+    while not condition():
+        wait_time = min(
+            STARTUP_RETRY_BASE_WAIT_SECONDS * (2 ** attempt),
+            STARTUP_RETRY_MAX_WAIT_SECONDS,
+        )
+        logger.warning(
+            f"Waiting for {description}, not available yet "
+            f"(attempt {attempt + 1}, retrying in {wait_time}s)"
+        )
+        sleep_with_heartbeat(wait_time)
+        attempt += 1
+
+    if attempt:
+        logger.info(f"{description} became available after {attempt + 1} attempts")
+    else:
+        logger.info(f"{description} available")
 
 
 def main():
@@ -300,27 +458,34 @@ def main():
     logger.info(f"Upload retries: {UPLOAD_RETRY_COUNT} (base wait: {UPLOAD_RETRY_BASE_WAIT_SECONDS}s)")
     logger.info("=" * 60)
 
-    # Verify scan folder exists
-    if not SCAN_FOLDER_PATH.exists():
-        logger.error(f"Scan folder does not exist: {SCAN_FOLDER_PATH}")
-        sys.exit(1)
+    # The health endpoint comes up before any check that can block or wait, so a
+    # probe gets an answer while we are still waiting for our dependencies.
+    start_health_server()
 
-    # Verify credentials
+    # A missing password is a configuration error. No amount of retrying fixes it,
+    # so this is the one startup condition that still exits.
     if not PAPERLESS_ADMIN_PASSWORD:
-        logger.error("PAPERLESS_ADMIN_PASSWORD not set")
+        logger.error("PAPERLESS_ADMIN_PASSWORD not set, this is a configuration error")
         sys.exit(1)
 
-    # Test authentication
-    logger.info("Testing Paperless authentication...")
-    token = authenticate_paperless()
-    if not token:
-        logger.error("Initial authentication test failed")
-        sys.exit(1)
-    logger.info("Authentication test successful")
+    # The mount and Paperless may simply not be up yet. Waiting for them is the job,
+    # not a failure: exiting here would only hand the same wait back to Kubernetes,
+    # inflate the restart counter and delay the start by the CrashLoopBackOff.
+    wait_until(
+        lambda: SCAN_FOLDER_PATH.exists(),
+        description=f"scan folder {SCAN_FOLDER_PATH}",
+    )
+    wait_until(
+        lambda: authenticate_paperless() is not None,
+        description=f"Paperless at {PAPERLESS_API_URL}",
+    )
+    logger.info("All dependencies reachable, entering processing loop")
+    health.startup_completed()
 
     # Main processing loop
     while True:
         try:
+            health.beat()
             pdf_files = get_pdf_files(SCAN_FOLDER_PATH)
 
             # Cleanup retry state for files that no longer exist
@@ -345,14 +510,14 @@ def main():
 
             # Wait before next scan
             logger.debug(f"Waiting {SCAN_INTERVAL_SECONDS}s until next scan...")
-            time.sleep(SCAN_INTERVAL_SECONDS)
+            sleep_with_heartbeat(SCAN_INTERVAL_SECONDS)
 
         except KeyboardInterrupt:
             logger.info("Received shutdown signal, exiting...")
             break
         except Exception as e:
             logger.error(f"Unexpected error in main loop: {e}", exc_info=True)
-            time.sleep(SCAN_INTERVAL_SECONDS)
+            sleep_with_heartbeat(SCAN_INTERVAL_SECONDS)
 
 
 if __name__ == '__main__':
