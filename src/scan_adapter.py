@@ -26,6 +26,13 @@ ARCHIVE_FOLDER_PATH = Path(os.getenv('ARCHIVE_FOLDER_PATH', '/mnt/scan/scan/arch
 LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
 PAPERLESS_ADMIN_USER = os.getenv('PAPERLESS_ADMIN_USER', 'admin')
 PAPERLESS_ADMIN_PASSWORD = os.getenv('PAPERLESS_ADMIN_PASSWORD', '')
+# Paperless versions its REST API through the Accept header (DRF
+# AcceptHeaderVersioning). A request without a version gets the server's
+# DEFAULT_VERSION, which moved from 9 to 10 in Paperless 3.0, so an unpinned
+# client silently changes behaviour the moment the server is upgraded.
+# Raise this deliberately after checking the changes for the calls below.
+PAPERLESS_API_VERSION = os.getenv('PAPERLESS_API_VERSION', '9')
+PAPERLESS_ACCEPT_HEADER = f'application/json; version={PAPERLESS_API_VERSION}'
 
 # Health endpoint. The heartbeat must outlive any single blocking call the worker
 # makes; the upload request timeout of 60s is the longest one, hence the default of
@@ -274,6 +281,7 @@ def authenticate_paperless() -> Optional[str]:
                 "username": PAPERLESS_ADMIN_USER,
                 "password": PAPERLESS_ADMIN_PASSWORD
             },
+            headers={'Accept': PAPERLESS_ACCEPT_HEADER},
             timeout=10
         )
 
@@ -297,7 +305,10 @@ def upload_file_to_paperless(filepath: Path, token: str) -> bool:
 
         with open(filepath, 'rb') as f:
             files = {'document': (filepath.name, f, 'application/pdf')}
-            headers = {'Authorization': f'Token {token}'}
+            headers = {
+                'Authorization': f'Token {token}',
+                'Accept': PAPERLESS_ACCEPT_HEADER,
+            }
 
             response = requests.post(
                 url,
