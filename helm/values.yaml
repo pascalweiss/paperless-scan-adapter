@@ -2,7 +2,11 @@ replicaCount: 1
 
 image:
   repository: registry.pwlab.dev/paperless-scan-adapter
-  tag: "0.2.1"
+  # Empty on purpose: the template falls back to .Chart.AppVersion, so the
+  # version lives in Chart.yaml alone. A tag pinned here silently outranks
+  # appVersion, which is how chart 0.2.2 shipped while still running the 0.2.1
+  # image. Set it only to deliberately run a version other than the chart's.
+  tag: ""
   pullPolicy: Always
 
 imagePullSecrets: []
