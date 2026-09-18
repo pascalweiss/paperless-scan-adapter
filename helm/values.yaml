@@ -6,7 +6,7 @@ image:
   # version lives in Chart.yaml alone. A tag pinned here silently outranks
   # appVersion, which is how chart 0.2.2 shipped while still running the 0.2.1
   # image. Set it only to deliberately run a version other than the chart's.
-  tag: ""
+  tag: "0.2.4"
   pullPolicy: Always
 
 imagePullSecrets: []
@@ -56,6 +56,7 @@ config:
     UPLOAD_RETRY_COUNT: "3"
     UPLOAD_RETRY_BASE_WAIT_SECONDS: "5"
     SCAN_INTERVAL_SECONDS: "5"
+    MIN_FILE_AGE_SECONDS: "15"
     PAPERLESS_API_URL: "http://paperless-ngx.paperless-ngx.svc.cluster.local:8000"
     SCAN_FOLDER_PATH: "/mnt/scan/scan"
     ARCHIVE_FOLDER_PATH: "/mnt/scan/scan/archive"

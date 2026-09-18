@@ -20,6 +20,12 @@ VALIDATION_RETRY_BASE_WAIT_SECONDS = int(os.getenv('VALIDATION_RETRY_BASE_WAIT_S
 UPLOAD_RETRY_COUNT = int(os.getenv('UPLOAD_RETRY_COUNT', '3'))
 UPLOAD_RETRY_BASE_WAIT_SECONDS = int(os.getenv('UPLOAD_RETRY_BASE_WAIT_SECONDS', '5'))
 SCAN_INTERVAL_SECONDS = int(os.getenv('SCAN_INTERVAL_SECONDS', '5'))
+# A file this fresh may still be an open write handle on the scanner's side. Opening
+# it here for validation forces Samba to send an SMB2 oplock break to that handle,
+# which the scanner's SMB2 client (see the credit-flow-control quirk documented for
+# the Brother ADS-2600W) can fail to handle mid-transfer. Skipping fresh files avoids
+# ever touching a file the scanner might still be writing.
+MIN_FILE_AGE_SECONDS = int(os.getenv('MIN_FILE_AGE_SECONDS', '15'))
 PAPERLESS_API_URL = os.getenv('PAPERLESS_API_URL', 'http://paperless-ngx.paperless-ngx.svc.cluster.local:8000')
 SCAN_FOLDER_PATH = Path(os.getenv('SCAN_FOLDER_PATH', '/mnt/scan/scan'))
 ARCHIVE_FOLDER_PATH = Path(os.getenv('ARCHIVE_FOLDER_PATH', '/mnt/scan/scan/archive'))
@@ -500,6 +506,7 @@ def main():
     logger.info(f"Archive folder: {ARCHIVE_FOLDER_PATH}")
     logger.info(f"Paperless API: {PAPERLESS_API_URL}")
     logger.info(f"Scan interval: {SCAN_INTERVAL_SECONDS}s")
+    logger.info(f"Minimum file age before validation: {MIN_FILE_AGE_SECONDS}s")
     logger.info(f"Validation retries: {VALIDATION_RETRY_COUNT} (base wait: {VALIDATION_RETRY_BASE_WAIT_SECONDS}s)")
     logger.info(f"Upload retries: {UPLOAD_RETRY_COUNT} (base wait: {UPLOAD_RETRY_BASE_WAIT_SECONDS}s)")
     logger.info("=" * 60)
@@ -548,6 +555,18 @@ def main():
                 for pdf_file in pdf_files:
                     # Check if file still exists (might have been deleted/moved)
                     if not pdf_file.exists():
+                        continue
+
+                    try:
+                        file_age = time.time() - pdf_file.stat().st_mtime
+                    except OSError:
+                        continue
+
+                    if file_age < MIN_FILE_AGE_SECONDS:
+                        logger.debug(
+                            f"Skipping {pdf_file.name}, only {file_age:.1f}s old "
+                            f"(minimum {MIN_FILE_AGE_SECONDS}s)"
+                        )
                         continue
 
                     process_pdf_file(pdf_file)
