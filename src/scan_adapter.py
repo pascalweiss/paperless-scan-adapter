@@ -55,6 +55,11 @@ STARTUP_RETRY_MAX_WAIT_SECONDS = int(os.getenv('STARTUP_RETRY_MAX_WAIT_SECONDS',
 # Structure: {file_path: {"retry_count": int, "next_retry_time": float}}
 retry_state: Dict[str, Dict] = {}
 
+# Observed (size, mtime) per file path so we only open a file once its size and
+# mtime have been completely stationary across polls for MIN_FILE_AGE_SECONDS.
+# Structure: {file_path: {"size": int, "mtime": float, "stable_since": float}}
+file_observations: Dict[str, Dict[str, float]] = {}
+
 # Setup logging
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL),
@@ -401,61 +406,49 @@ def move_to_archive(filepath: Path) -> bool:
 
 def process_pdf_file(filepath: Path) -> bool:
     """Process a single PDF file. Returns True if file was handled (deleted or archived)."""
-    logger.info(f"Processing: {filepath.name}")
-
     file_key = str(filepath)
     current_time = time.time()
 
-    # Check if PDF is valid
-    if not is_pdf_valid(filepath):
-        # Initialize retry state for this file if not exists
-        if file_key not in retry_state:
-            retry_state[file_key] = {
-                "retry_count": 0,
-                "next_retry_time": current_time  # Can retry immediately on first attempt
-            }
-
+    if file_key in retry_state:
         state = retry_state[file_key]
-
-        # Check if we should attempt retry now
-        if current_time >= state["next_retry_time"]:
-            # Time to retry validation
-            retry_count = state["retry_count"]
-
-            if retry_count >= VALIDATION_RETRY_COUNT:
-                # Exceeded max retries, delete file
-                logger.warning(f"File exceeded {VALIDATION_RETRY_COUNT} validation retries, deleting: {filepath.name}")
-                delete_file(filepath)
-                del retry_state[file_key]
-                return True
-
-            # Attempt validation
-            logger.info(f"Attempting validation retry {retry_count + 1}/{VALIDATION_RETRY_COUNT} for: {filepath.name}")
-
-            if is_pdf_valid(filepath):
-                # File became valid! Clear retry state and continue to upload
-                logger.info(f"File became valid after {retry_count + 1} attempts: {filepath.name}")
-                del retry_state[file_key]
-                # Continue to upload below
-            else:
-                # Still invalid, schedule next retry with exponential backoff
-                wait_time = VALIDATION_RETRY_BASE_WAIT_SECONDS * (2 ** retry_count)
-                next_retry = current_time + wait_time
-                state["retry_count"] = retry_count + 1
-                state["next_retry_time"] = next_retry
-
-                logger.info(f"File still invalid, will retry in {wait_time}s (attempt {retry_count + 1}/{VALIDATION_RETRY_COUNT}): {filepath.name}")
-                return False  # Skip for now, will retry later
-        else:
-            # Not time to retry yet, skip this file
+        if current_time < state["next_retry_time"]:
             wait_remaining = int(state["next_retry_time"] - current_time)
             logger.debug(f"File in retry waiting period ({wait_remaining}s remaining): {filepath.name}")
-            return False  # Non-blocking: continue to next file
+            return False
 
-    # PDF is valid (either was valid initially or became valid after retry)
-    # Clear retry state if exists
-    if file_key in retry_state:
-        del retry_state[file_key]
+        retry_count = state["retry_count"]
+        if retry_count >= VALIDATION_RETRY_COUNT:
+            logger.warning(f"File exceeded {VALIDATION_RETRY_COUNT} validation retries, deleting: {filepath.name}")
+            delete_file(filepath)
+            del retry_state[file_key]
+            return True
+
+        logger.info(f"Attempting validation retry {retry_count + 1}/{VALIDATION_RETRY_COUNT} for: {filepath.name}")
+        if is_pdf_valid(filepath):
+            logger.info(f"File became valid after {retry_count + 1} attempts: {filepath.name}")
+            del retry_state[file_key]
+        else:
+            wait_time = VALIDATION_RETRY_BASE_WAIT_SECONDS * (2 ** retry_count)
+            state["retry_count"] = retry_count + 1
+            state["next_retry_time"] = current_time + wait_time
+            logger.info(
+                f"File still invalid, will retry in {wait_time}s "
+                f"(attempt {retry_count + 1}/{VALIDATION_RETRY_COUNT}): {filepath.name}"
+            )
+            return False
+    else:
+        logger.info(f"Processing: {filepath.name}")
+        if not is_pdf_valid(filepath):
+            wait_time = VALIDATION_RETRY_BASE_WAIT_SECONDS
+            retry_state[file_key] = {
+                "retry_count": 1,
+                "next_retry_time": current_time + wait_time,
+            }
+            logger.info(
+                f"File still invalid, will retry in {wait_time}s "
+                f"(attempt 1/{VALIDATION_RETRY_COUNT}): {filepath.name}"
+            )
+            return False
 
     # Attempt upload
     if upload_to_paperless_with_retry(filepath):
@@ -541,12 +534,13 @@ def main():
             health.beat()
             pdf_files = get_pdf_files(SCAN_FOLDER_PATH)
 
-            # Cleanup retry state for files that no longer exist
+            # Cleanup retry and observation state for files that no longer exist
             current_file_keys = {str(f) for f in pdf_files}
-            keys_to_remove = [k for k in retry_state.keys() if k not in current_file_keys]
-            for key in keys_to_remove:
-                del retry_state[key]
-                logger.debug(f"Removed retry state for deleted file: {key}")
+            for state_dict in (retry_state, file_observations):
+                keys_to_remove = [k for k in state_dict.keys() if k not in current_file_keys]
+                for key in keys_to_remove:
+                    del state_dict[key]
+                    logger.debug(f"Removed state for deleted file: {key}")
 
             if pdf_files:
                 logger.info(f"Found {len(pdf_files)} PDF file(s) to process")
@@ -558,13 +552,42 @@ def main():
                         continue
 
                     try:
-                        file_age = time.time() - pdf_file.stat().st_mtime
+                        st = pdf_file.stat()
                     except OSError:
                         continue
 
+                    now = time.time()
+                    file_key = str(pdf_file)
+
+                    if st.st_size == 0:
+                        file_observations[file_key] = {
+                            "size": 0,
+                            "mtime": st.st_mtime,
+                            "stable_since": now,
+                        }
+                        logger.debug(f"Skipping {pdf_file.name}, file is still empty (0 bytes)")
+                        continue
+
+                    obs = file_observations.get(file_key)
+                    if obs is None or obs["size"] != st.st_size or obs["mtime"] != st.st_mtime:
+                        file_observations[file_key] = {
+                            "size": st.st_size,
+                            "mtime": st.st_mtime,
+                            "stable_since": now,
+                        }
+                        retry_state.pop(file_key, None)
+                        logger.debug(
+                            f"Skipping {pdf_file.name}, size/mtime still changing "
+                            f"(size={st.st_size}, waiting {MIN_FILE_AGE_SECONDS}s of stability)"
+                        )
+                        continue
+
+                    stable_age = now - obs["stable_since"]
+                    mtime_age = now - st.st_mtime
+                    file_age = min(stable_age, mtime_age)
                     if file_age < MIN_FILE_AGE_SECONDS:
                         logger.debug(
-                            f"Skipping {pdf_file.name}, only {file_age:.1f}s old "
+                            f"Skipping {pdf_file.name}, only {file_age:.1f}s stable "
                             f"(minimum {MIN_FILE_AGE_SECONDS}s)"
                         )
                         continue

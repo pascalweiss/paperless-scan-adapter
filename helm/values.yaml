@@ -6,7 +6,7 @@ image:
   # version lives in Chart.yaml alone. A tag pinned here silently outranks
   # appVersion, which is how chart 0.2.2 shipped while still running the 0.2.1
   # image. Set it only to deliberately run a version other than the chart's.
-  tag: "0.2.4"
+  tag: "0.2.5"
   pullPolicy: Always
 
 imagePullSecrets: []
@@ -141,8 +141,8 @@ persistence:
         - file_mode=0777
         - uid=1000
         - gid=1000
-        - cache=strict
-        - actimeo=30
+        - cache=none
+        - actimeo=0
       csi:
         driver: smb.csi.k8s.io
         volumeHandle: paperless-scan-adapter-pv
